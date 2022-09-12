@@ -118,6 +118,7 @@ fn main() {
     config.set_disable_active_migration(!conn_args.enable_active_migration);
     config.set_active_connection_id_limit(conn_args.max_active_cids);
     config.set_multipath(conn_args.multipath);
+    config.enable_multipath_events(args.priority);
 
     config.set_max_connection_window(conn_args.max_window);
     config.set_max_stream_window(conn_args.max_stream_window);
@@ -774,6 +775,10 @@ fn handle_path_events(client: &mut Client) {
                     .set_path_status(addr.0, addr.1, path_status, false)
                     .map_err(|e| error!("cannot follow status request: {}", e))
                     .ok();
+            },
+
+            quiche::PathEvent::PeerUsed(stream_id, path) => {
+                info!("Peer first used {:?} for stream ID {}", path, stream_id);
             },
         }
     }

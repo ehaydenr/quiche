@@ -686,6 +686,8 @@ pub struct Config {
     max_connection_window: u64,
     max_stream_window: u64,
 
+    multipath_events: bool,
+
     disable_dcid_reuse: bool,
 }
 
@@ -743,6 +745,8 @@ impl Config {
 
             max_connection_window: MAX_CONNECTION_WINDOW,
             max_stream_window: stream::MAX_STREAM_WINDOW,
+
+            multipath_events: false,
 
             disable_dcid_reuse: false,
         })
@@ -1155,6 +1159,16 @@ impl Config {
     pub fn set_disable_dcid_reuse(&mut self, v: bool) {
         self.disable_dcid_reuse = v;
     }
+
+    /// Configures the generation of Multipath-specific QUIC events.
+    ///
+    /// This value is only considered if `enable_events()` has been called with
+    /// a `true` value.
+    ///
+    /// The default value is `false`.
+    pub fn enable_multipath_events(&mut self, v: bool) {
+        self.multipath_events = v;
+    }
 }
 
 /// A QUIC connection.
@@ -1191,6 +1205,9 @@ pub struct Connection {
 
     /// The path manager.
     paths: path::PathMap,
+
+    /// Multipath-specific events to be notified to the application.
+    multipath_events: Option<VecDeque<PathEvent>>,
 
     /// List of supported application protocols.
     application_protos: Vec<Vec<u8>>,
@@ -1655,6 +1672,8 @@ impl Connection {
             reset_token,
         );
 
+        let multipath_events = config.multipath_events.then(VecDeque::new);
+
         let mut conn = Connection {
             version: config.version,
 
@@ -1675,6 +1694,7 @@ impl Connection {
             recovery_config,
 
             paths,
+            multipath_events,
 
             application_protos: config.application_protos.clone(),
 
@@ -4031,15 +4051,17 @@ impl Connection {
             }
         }
 
+        let consider_standby_paths = self.paths.consider_standby_paths();
         // Create a single STREAM frame for the first stream that is flushable.
         if (pkt_type == packet::Type::Short || pkt_type == packet::Type::ZeroRTT) &&
             left > frame::MAX_STREAM_OVERHEAD &&
             !is_closing &&
             self.paths.get(send_pid)?.active() &&
-            !dgram_emitted &&
-            (self.paths.consider_standby_paths() ||
-                !self.paths.get(send_pid)?.is_standby())
+            !dgram_emitted
         {
+            let mut invalid_path_priority = VecDeque::new();
+            let can_send =
+                consider_standby_paths || !self.paths.get(send_pid)?.is_standby();
             while let Some(stream_id) = self.streams.pop_flushable() {
                 let stream = match self.streams.get_mut(stream_id) {
                     Some(v) => v,
@@ -4052,6 +4074,25 @@ impl Connection {
                 // This might happen if stream data was buffered but not yet
                 // flushed on the wire when a STOP_SENDING frame is received.
                 if stream.send.is_stopped() {
+                    continue;
+                }
+
+                // If this stream cannot be sent on this path, reinsert it as
+                // flushable once the loop ended.
+                if !stream.can_send_on_path(
+                    &(
+                        self.paths.get(send_pid)?.local_addr(),
+                        self.paths.get(send_pid)?.peer_addr(),
+                    ),
+                    can_send,
+                ) {
+                    let urgency = stream.urgency;
+                    let incremental = stream.incremental;
+                    invalid_path_priority.push_back((
+                        stream_id,
+                        urgency,
+                        incremental,
+                    ));
                     continue;
                 }
 
@@ -4137,6 +4178,10 @@ impl Connection {
                 }
 
                 break;
+            }
+
+            for (stream_id, urgency, incremental) in invalid_path_priority {
+                self.streams.push_flushable(stream_id, urgency, incremental);
             }
         }
 
@@ -5694,6 +5739,25 @@ impl Connection {
         Ok(())
     }
 
+    /// Pins the sending of the specified stream ID to the `usable_addrs` slice
+    /// list, in decreasing preference order. While any of the paths referenced
+    /// by the list is still present, it avoids using non-listed paths.
+    ///
+    /// In case a stream ID refers to a non-open stream, this method raises an
+    /// [`InvalidState`]. Note that specifying 4-tuples in `usable_addrs` that
+    /// does not map to existing paths has no effect.
+    ///
+    /// [`InvalidState`]: enum.Error.html#InvalidState
+    pub fn pin_stream_to_paths(
+        &mut self, stream_id: u64, pinned_addrs: &[(SocketAddr, SocketAddr)],
+    ) -> Result<()> {
+        let stream =
+            self.streams.get_mut(stream_id).ok_or(Error::InvalidState)?;
+        stream.bind_to_paths(pinned_addrs);
+        self.paths.record_bound_stream();
+        Ok(())
+    }
+
     /// Provides additional source Connection IDs that the peer can use to reach
     /// this host.
     ///
@@ -5830,6 +5894,14 @@ impl Connection {
     ///
     /// [`PathEvent`]: enum.PathEvent.html
     pub fn path_event_next(&mut self) -> Option<PathEvent> {
+        if let Some(me) = self
+            .multipath_events
+            .as_mut()
+            .and_then(|evs| evs.pop_front())
+        {
+            return Some(me);
+        }
+
         self.paths.pop_event()
     }
 
@@ -6740,6 +6812,14 @@ impl Connection {
 
                 let max_rx_data_left = self.max_rx_data() - self.rx_data;
 
+                let has_multipath_events = self.multipath_events.is_some();
+                let recv_addr = if has_multipath_events {
+                    let recv_path = self.paths.get(recv_path_id)?;
+                    Some((recv_path.local_addr(), recv_path.peer_addr()))
+                } else {
+                    None
+                };
+
                 // Get existing stream or create a new one, but if the stream
                 // has already been closed and collected, ignore the frame.
                 //
@@ -6772,7 +6852,27 @@ impl Connection {
 
                 stream.recv.write(data)?;
 
-                if !was_readable && stream.is_readable() {
+                let now_readable = stream.is_readable();
+
+                if let Some(recv_addr) = recv_addr {
+                    let known_mapping = stream
+                        .recv_paths
+                        .as_ref()
+                        .map_or(false, |hs| hs.contains(&recv_addr));
+                    if !known_mapping {
+                        stream
+                            .recv_paths
+                            .get_or_insert_with(HashSet::new)
+                            .insert(recv_addr);
+                        if let Some(evs) = self.multipath_events.as_mut() {
+                            evs.push_back(PathEvent::PeerUsed(
+                                stream_id, recv_addr,
+                            ));
+                        }
+                    }
+                }
+
+                if !was_readable && now_readable {
                     self.streams.mark_readable(stream_id, true);
                 }
 
@@ -7373,6 +7473,89 @@ impl Connection {
         Ok(pid)
     }
 
+    fn get_send_path_id_multipath_data(
+        &self, from: Option<SocketAddr>, to: Option<SocketAddr>,
+    ) -> Option<usize> {
+        // When using aggregate mode, favour lowest-latency path on which CWIN
+        // is open. This should only be used when data need to be sent.
+        // If we have a stream-specific priority, let's do another round while
+        // considering all paths.
+        let mut consider_standby = false;
+        // We first need to consider pinned streams.
+        if self.paths.has_bound_stream() {
+            if let Some(hs) = self
+                .streams
+                .peek_flushable()
+                .and_then(|sid| self.streams.get(sid))
+                .and_then(|s| s.bound_paths.as_ref())
+            {
+                if let Some(pid) = self
+                    .paths
+                    .iter()
+                    .filter(|(_, p)| {
+                        if let Some(f) = from {
+                            p.local_addr() == f
+                        } else {
+                            true
+                        }
+                    })
+                    .filter(|(_, p)| {
+                        if let Some(t) = to {
+                            p.peer_addr() == t
+                        } else {
+                            true
+                        }
+                    })
+                    .filter(|(_, p)| {
+                        hs.contains(&(p.local_addr(), p.peer_addr()))
+                    })
+                    .filter(|(_, p)| {
+                        p.active() && p.recovery.cwnd_available() > 0
+                    })
+                    .min_by_key(|(_, p)| p.recovery.rtt())
+                    .map(|(pid, _)| pid)
+                {
+                    return Some(pid);
+                }
+            }
+        }
+        loop {
+            if let Some(pid) = self
+                .paths
+                .iter()
+                .filter(|(_, p)| {
+                    if let Some(f) = from {
+                        p.local_addr() == f
+                    } else {
+                        true
+                    }
+                })
+                .filter(|(_, p)| {
+                    if let Some(t) = to {
+                        p.peer_addr() == t
+                    } else {
+                        true
+                    }
+                })
+                .filter(|(_, p)| consider_standby || !p.is_standby())
+                .filter(|(_, p)| p.active() && p.recovery.cwnd_available() > 0)
+                .min_by_key(|(_, p)| p.recovery.rtt())
+                .map(|(pid, _)| pid)
+            {
+                return Some(pid);
+            }
+            if consider_standby ||
+                (!self.paths.consider_standby_paths() &&
+                    !self.paths.has_bound_stream())
+            {
+                break;
+            }
+            consider_standby = true;
+        }
+
+        None
+    }
+
     /// Selects the path on which the next packet must be sent.
     fn get_send_path_id(
         &self, from: Option<SocketAddr>, to: Option<SocketAddr>,
@@ -7394,45 +7577,11 @@ impl Connection {
             }
         }
 
-        let mut consider_backup = false;
         let dgrams_to_emit = self.dgram_max_writable_len().is_some();
         let stream_to_emit = self.streams.has_flushable();
-        // When using aggregate mode, favour lowest-latency path on which CWIN
-        // is open. This should only be used when data need to be sent.
-        // If we have a stream-specific priority, let's do another round while
-        // considering all paths.
         if self.paths.multipath() && (dgrams_to_emit || stream_to_emit) {
-            loop {
-                if let Some(pid) = self
-                    .paths
-                    .iter()
-                    .filter(|(_, p)| {
-                        if let Some(f) = from {
-                            p.local_addr() == f
-                        } else {
-                            true
-                        }
-                    })
-                    .filter(|(_, p)| {
-                        if let Some(t) = to {
-                            p.peer_addr() == t
-                        } else {
-                            true
-                        }
-                    })
-                    .filter(|(_, p)| consider_backup || !p.is_standby())
-                    .filter(|(_, p)| {
-                        p.active() && p.recovery.cwnd_available() > 0
-                    })
-                    .min_by_key(|(_, p)| p.recovery.rtt())
-                    .map(|(pid, _)| pid)
-                {
-                    return Ok(pid);
-                }
-                if consider_backup || !self.paths.consider_standby_paths() {
-                    break;
-                }
-                consider_backup = true;
+            if let Some(pid) = self.get_send_path_id_multipath_data(from, to) {
+                return Ok(pid);
             }
         }
 
@@ -15742,6 +15891,177 @@ mod tests {
 
         assert_eq!(pipe.client.is_multipath_enabled(), false);
         assert_eq!(pipe.server.is_multipath_enabled(), false);
+    }
+
+    #[test]
+    fn multipath_stream_priority() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(1000000);
+        config.set_initial_max_stream_data_bidi_local(1000000);
+        config.set_initial_max_stream_data_bidi_remote(1000000);
+        config.set_initial_max_streams_bidi(2);
+        config.enable_multipath_events(true);
+        config.set_multipath(true);
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+
+        assert_eq!(pipe.client.is_multipath_enabled(), true);
+        assert_eq!(pipe.server.is_multipath_enabled(), true);
+
+        let client_addr = testing::Pipe::client_addr();
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::Validated(client_addr_2, server_addr))
+        );
+        assert_eq!(pipe.client.path_event_next(), None);
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::New(server_addr, client_addr_2))
+        );
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::Validated(server_addr, client_addr_2))
+        );
+        assert_eq!(pipe.server.path_event_next(), None);
+
+        assert_eq!(
+            pipe.client.set_active(client_addr_2, server_addr, true),
+            Ok(())
+        );
+        assert_eq!(
+            pipe.server.set_active(server_addr, client_addr_2, true),
+            Ok(())
+        );
+
+        assert_eq!(pipe.client.stream_send(0, b"hi", true), Ok(2));
+        assert_eq!(
+            pipe.client.set_path_status(
+                client_addr_2,
+                server_addr,
+                PathStatus::Standby,
+                true
+            ),
+            Ok(())
+        );
+        assert_eq!(pipe.advance(), Ok(()));
+
+        const DATA_BYTES: usize = 24000;
+        let mut buf = [42; DATA_BYTES];
+        assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((2, true)));
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::PeerUsed(0, (server_addr, client_addr)))
+        );
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::PeerPathStatus(
+                (server_addr, client_addr_2),
+                PathStatus::Standby,
+            )),
+        );
+        assert_eq!(pipe.server.path_event_next(), None);
+
+        // Let's follow the request of the client.
+        assert_eq!(
+            pipe.server.set_path_status(
+                server_addr,
+                client_addr_2,
+                PathStatus::Standby,
+                false
+            ),
+            Ok(())
+        );
+        assert_eq!(pipe.server.stream_send(0, &buf, true), Ok(24000));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(pipe.client.stream_recv(0, &mut buf), Ok((24000, true)));
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::PeerUsed(0, (client_addr, server_addr)))
+        );
+        assert_eq!(pipe.client.path_event_next(), None);
+
+        // Stream-specific.
+        assert_eq!(pipe.client.stream_send(4, b"hi", true), Ok(2));
+        assert_eq!(
+            pipe.client
+                .pin_stream_to_paths(4, &[(client_addr_2, server_addr)]),
+            Ok(())
+        );
+        assert_eq!(pipe.advance(), Ok(()));
+
+        const SECOND_DATA_BYTES: usize = 36000;
+        let mut buf = [42; SECOND_DATA_BYTES];
+        assert_eq!(pipe.server.stream_recv(4, &mut buf), Ok((2, true)));
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::PeerUsed(4, (server_addr, client_addr_2)))
+        );
+        assert_eq!(pipe.server.path_event_next(), None);
+
+        // Let's implicitly pin this stream to the used path.
+        assert_eq!(
+            pipe.server
+                .pin_stream_to_paths(4, &[(server_addr, client_addr_2)]),
+            Ok(())
+        );
+        assert_eq!(pipe.server.stream_send(4, &buf, true), Ok(36000));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(pipe.client.stream_recv(4, &mut buf), Ok((36000, true)));
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::PeerUsed(4, (client_addr_2, server_addr)))
+        );
+        assert_eq!(pipe.client.path_event_next(), None);
+
+        // Let's use both paths together.
+        assert_eq!(pipe.client.stream_send(8, b"hi", true), Ok(2));
+        assert_eq!(pipe.advance(), Ok(()));
+        const THIRD_DATA_BYTES: usize = 70000;
+        let mut buf = [42; THIRD_DATA_BYTES];
+
+        assert_eq!(pipe.server.stream_recv(8, &mut buf), Ok((2, true)));
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::PeerUsed(8, (server_addr, client_addr)))
+        );
+        assert_eq!(pipe.server.path_event_next(), None);
+        assert_eq!(pipe.server.stream_send(8, &buf, true), Ok(70000));
+        assert_eq!(
+            pipe.server.pin_stream_to_paths(8, &[
+                (server_addr, client_addr),
+                (server_addr, client_addr_2)
+            ]),
+            Ok(())
+        );
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(pipe.client.stream_recv(8, &mut buf), Ok((70000, true)));
+
+        // The exact order is not important here.
+        let mut events = Vec::with_capacity(2);
+        events.push(pipe.client.path_event_next().unwrap());
+        events.push(pipe.client.path_event_next().unwrap());
+        assert!(
+            events.contains(&PathEvent::PeerUsed(8, (client_addr, server_addr)))
+        );
+        assert!(events
+            .contains(&PathEvent::PeerUsed(8, (client_addr_2, server_addr))));
+        assert_eq!(pipe.client.path_event_next(), None);
     }
 }
 

@@ -159,6 +159,10 @@ pub enum PathEvent {
 
     /// The peer advertised the path status for the mentioned 4-tuple.
     PeerPathStatus((SocketAddr, SocketAddr), PathStatus),
+
+    /// The host locally received data for the given stream ID on the given
+    /// 4-tuple for the first time.
+    PeerUsed(u64, (SocketAddr, SocketAddr)),
 }
 
 /// A network path on which QUIC packets can be sent.
@@ -649,6 +653,8 @@ pub struct PathMap {
     path_status_to_advertise: VecDeque<(usize, u64, u64)>,
     /// The sequence number for the next PATH_ABANDON.
     next_path_status_seq_num: u64,
+    /// Whether it has a stream bound to some paths.
+    has_bound_stream: bool,
 }
 
 impl PathMap {
@@ -679,6 +685,7 @@ impl PathMap {
             path_abandon: VecDeque::new(),
             path_status_to_advertise: VecDeque::new(),
             next_path_status_seq_num: 0,
+            has_bound_stream: false,
         }
     }
 
@@ -1157,6 +1164,14 @@ impl PathMap {
                     .push_back(PathEvent::PeerPathStatus(addr, path_status));
             }
         }
+    }
+
+    pub fn record_bound_stream(&mut self) {
+        self.has_bound_stream = true;
+    }
+
+    pub fn has_bound_stream(&self) -> bool {
+        self.has_bound_stream
     }
 }
 

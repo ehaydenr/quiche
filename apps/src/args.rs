@@ -464,6 +464,7 @@ Options:
   --qpack-blocked-streams STREAMS   Limit of streams that can be blocked while decoding. Any value other that 0 is currently unsupported.
   --disable-gso               Disable GSO (linux only).
   --multipath                 Enable multipath support.
+  --multipath-priority        Enable multipath priority support.
   -h --help                   Show this screen.
 ";
 
@@ -476,6 +477,7 @@ pub struct ServerArgs {
     pub cert: String,
     pub key: String,
     pub disable_gso: bool,
+    pub priority: bool,
 }
 
 impl Args for ServerArgs {
@@ -490,6 +492,8 @@ impl Args for ServerArgs {
         let key = args.get_str("--key").to_string();
         let disable_gso = args.get_bool("--disable-gso");
 
+        let priority = args.get_bool("--multipath-priority");
+
         ServerArgs {
             listen,
             no_retry,
@@ -498,6 +502,7 @@ impl Args for ServerArgs {
             cert,
             key,
             disable_gso,
+            priority,
         }
     }
 }

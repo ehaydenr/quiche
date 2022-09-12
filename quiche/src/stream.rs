@@ -36,6 +36,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
+use std::net::SocketAddr;
+
 use std::time;
 
 use crate::Error;
@@ -361,6 +363,22 @@ impl StreamMap {
         };
     }
 
+    /// Returns the first stream ID from the flushable streams queue with the
+    /// specified urgency, without removing it.
+    pub fn peek_flushable(&self) -> Option<u64> {
+        // Peek the first element from the queue corresponding to the lowest
+        // urgency that has elements.
+        if let Some((_, queues)) = self.flushable.iter().next() {
+            if !queues.0.is_empty() {
+                return queues.0.peek().map(|x| x.0);
+            } else {
+                return queues.1.front().copied();
+            }
+        }
+
+        None
+    }
+
     /// Removes and returns the first stream ID from the flushable streams
     /// queue with the specified urgency.
     ///
@@ -654,6 +672,12 @@ pub struct Stream {
 
     /// Whether the stream can be flushed incrementally. Default is `true`.
     pub incremental: bool,
+
+    /// Tracks on which 4-tuples the stream data has been received.
+    pub recv_paths: Option<HashSet<(SocketAddr, SocketAddr)>>,
+
+    /// The 4-tuples to which this stream is bound.
+    pub bound_paths: Option<HashSet<(SocketAddr, SocketAddr)>>,
 }
 
 impl Stream {
@@ -670,6 +694,8 @@ impl Stream {
             data: None,
             urgency: DEFAULT_URGENCY,
             incremental: true,
+            recv_paths: None,
+            bound_paths: None,
         }
     }
 
@@ -720,6 +746,21 @@ impl Stream {
     /// Returns true if the stream is not storing incoming data.
     pub fn is_draining(&self) -> bool {
         self.recv.drain
+    }
+
+    /// Binds the stream to the provided 4-tuples.
+    pub fn bind_to_paths(&mut self, addrs: &[(SocketAddr, SocketAddr)]) {
+        self.bound_paths = Some(addrs.iter().copied().collect());
+    }
+
+    /// Whether this stream can be sent on the 4-tuple passed in argument.
+    pub fn can_send_on_path(
+        &self, addr: &(SocketAddr, SocketAddr), can_send: bool,
+    ) -> bool {
+        self.bound_paths
+            .as_ref()
+            .map(|paths| paths.contains(addr))
+            .unwrap_or(can_send)
     }
 }
 

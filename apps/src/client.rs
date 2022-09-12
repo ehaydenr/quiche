@@ -488,6 +488,8 @@ pub fn connect(
                 quiche::PathEvent::PeerMigrated(..) => unreachable!(),
 
                 quiche::PathEvent::PeerPathStatus(..) => {},
+
+                quiche::PathEvent::PeerUsed(..) => unreachable!(),
             }
         }
 
