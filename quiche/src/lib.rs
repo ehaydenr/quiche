@@ -4138,6 +4138,7 @@ impl Connection {
             !dgram_emitted &&
             (consider_standby_paths || !path.is_standby())
         {
+            let mut skip = VecDeque::new();
             while let Some(stream_id) = self.streams.peek_flushable() {
                 let stream = match self.streams.get_mut(stream_id) {
                     // Avoid sending frames for streams that were already stopped.
@@ -4150,6 +4151,30 @@ impl Connection {
                         continue;
                     },
                 };
+
+                // If this stream is pinned to a different path, check if the path
+                // exists. If it doesn't, keep it simple by pinning to this path
+                if let Some(pin_path) = stream.pin_path {
+                    if pin_path != send_pid {
+                        if let Ok(path) = self.paths.get(pin_path) {
+                            if path.usable() {
+                                log::trace!("skipping usable pinned path");
+                                // Path is usable, skip
+                                skip.push_back((
+                                    stream_id,
+                                    stream.urgency,
+                                    stream.incremental,
+                                ));
+                                self.streams.remove_flushable();
+                                continue;
+                            }
+                        }
+
+                        // If we got this far, the path is either gone or not
+                        // usable. Reassign to current path.
+                        stream.set_pin_path(send_pid);
+                    }
+                }
 
                 let stream_off = stream.send.off_front();
 
@@ -4226,7 +4251,14 @@ impl Connection {
 
                 break;
             }
+
+            for (id, urgency, incremental) in skip {
+                log::trace!("pushing skipped path as flushable");
+                self.streams.push_flushable(id, urgency, incremental);
+            }
         }
+
+        let path = self.paths.get_mut(send_pid)?;
 
         // Alternate trying to send DATAGRAMs next time.
         self.emit_dgram = !dgram_emitted;
@@ -6914,6 +6946,8 @@ impl Connection {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
+                let multipath_enabled = self.is_multipath_enabled();
+                let is_server = self.is_server;
                 let stream = match self.get_or_create_stream(stream_id, false) {
                     Ok(v) => v,
 
@@ -6921,6 +6955,12 @@ impl Connection {
 
                     Err(e) => return Err(e),
                 };
+
+                // For now, hardcode that the path we receive on is that one we
+                // pin to if multipath is enabled
+                if multipath_enabled && is_server {
+                    stream.set_pin_path(recv_path_id);
+                }
 
                 // Check for the connection-level flow control limit.
                 let max_off_delta =
@@ -8598,11 +8638,22 @@ pub mod testing {
         }
 
         pub fn advance(&mut self) -> Result<()> {
+            self.advance_on_path(None, None)
+        }
+
+        pub fn advance_on_path(
+            &mut self, client_addr: Option<SocketAddr>,
+            server_addr: Option<SocketAddr>,
+        ) -> Result<()> {
             let mut client_done = false;
             let mut server_done = false;
 
             while !client_done || !server_done {
-                match emit_flight(&mut self.client) {
+                match emit_flight_on_path(
+                    &mut self.client,
+                    client_addr,
+                    server_addr,
+                ) {
                     Ok(flight) => process_flight(&mut self.server, flight)?,
 
                     Err(Error::Done) => client_done = true,
@@ -8610,7 +8661,11 @@ pub mod testing {
                     Err(e) => return Err(e),
                 };
 
-                match emit_flight(&mut self.server) {
+                match emit_flight_on_path(
+                    &mut self.server,
+                    server_addr,
+                    client_addr,
+                ) {
                     Ok(flight) => process_flight(&mut self.client, flight)?,
 
                     Err(Error::Done) => server_done = true,
@@ -8691,14 +8746,15 @@ pub mod testing {
     }
 
     pub fn emit_flight_with_max_buffer(
-        conn: &mut Connection, out_size: usize,
+        conn: &mut Connection, out_size: usize, from: Option<SocketAddr>,
+        to: Option<SocketAddr>,
     ) -> Result<Vec<(Vec<u8>, SendInfo)>> {
         let mut flight = Vec::new();
 
         loop {
             let mut out = vec![0u8; out_size];
 
-            let info = match conn.send(&mut out) {
+            let info = match conn.send_on_path(&mut out, from, to) {
                 Ok((written, info)) => {
                     out.truncate(written);
                     info
@@ -8722,7 +8778,13 @@ pub mod testing {
     pub fn emit_flight(
         conn: &mut Connection,
     ) -> Result<Vec<(Vec<u8>, SendInfo)>> {
-        emit_flight_with_max_buffer(conn, 65535)
+        emit_flight_with_max_buffer(conn, 65535, None, None)
+    }
+
+    pub fn emit_flight_on_path(
+        conn: &mut Connection, from: Option<SocketAddr>, to: Option<SocketAddr>,
+    ) -> Result<Vec<(Vec<u8>, SendInfo)>> {
+        emit_flight_with_max_buffer(conn, 65535, from, to)
     }
 
     pub fn encode_pkt(
@@ -15131,8 +15193,13 @@ mod tests {
         // Limited MTU of 1199 bytes for some reason.
         testing::process_flight(
             &mut pipe.server,
-            testing::emit_flight_with_max_buffer(&mut pipe.client, 1199)
-                .expect("no packet"),
+            testing::emit_flight_with_max_buffer(
+                &mut pipe.client,
+                1199,
+                None,
+                None,
+            )
+            .expect("no packet"),
         )
         .expect("error when processing client packets");
         testing::process_flight(
@@ -16302,6 +16369,319 @@ mod tests {
         assert_eq!(path_s2c_1.active(), true);
         assert!(path_s2c_0.recovery.bytes_sent >= DATA_BYTES / 2);
         assert!(path_s2c_1.recovery.bytes_sent >= DATA_BYTES / 2);
+
+        // Now close the initial path.
+        assert_eq!(
+            pipe.client.abandon_path(
+                client_addr,
+                server_addr,
+                0,
+                "no error".into(),
+            ),
+            Ok(()),
+        );
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+
+        assert_eq!(path_c2s_0.active(), false);
+        assert_eq!(path_c2s_1.active(), true);
+        assert_eq!(path_s2c_0.active(), true);
+        assert_eq!(path_s2c_1.active(), true);
+
+        assert_eq!(pipe.advance(), Ok(()));
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+
+        assert_eq!(path_c2s_0.active(), false);
+        assert_eq!(path_c2s_1.active(), true);
+        assert_eq!(path_s2c_0.active(), false);
+        assert_eq!(path_s2c_1.active(), true);
+
+        // No more in-flight packets on closed paths.
+        assert_eq!(
+            path_c2s_0.recovery.cwnd(),
+            path_c2s_0.recovery.cwnd_available()
+        );
+        assert_eq!(
+            path_s2c_0.recovery.cwnd(),
+            path_s2c_0.recovery.cwnd_available()
+        );
+
+        assert_eq!(pipe.server.retired_scid_next(), Some(cid_c2s_0));
+        assert_eq!(pipe.server.retired_scid_next(), None);
+
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::Closed(
+                server_addr,
+                client_addr,
+                0,
+                "no error".into(),
+            ))
+        );
+
+        assert_eq!(pipe.client.retired_scid_next(), Some(cid_s2c_0));
+        assert_eq!(pipe.client.retired_scid_next(), None);
+
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::Closed(
+                client_addr,
+                server_addr,
+                0,
+                "no error".into(),
+            ))
+        );
+    }
+
+    #[test]
+    fn multipath_stream_affinity() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(100000);
+        config.set_initial_max_stream_data_bidi_local(100000);
+        config.set_initial_max_stream_data_bidi_remote(100000);
+        config.set_initial_max_streams_bidi(2);
+        // To test with enabled datagrams.
+        config.enable_dgram(true, 10, 10);
+        config.set_multipath(true);
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+
+        assert_eq!(pipe.client.is_multipath_enabled(), true);
+        assert_eq!(pipe.server.is_multipath_enabled(), true);
+
+        let client_addr = testing::Pipe::client_addr();
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+        let cid_c2s_0 = pipe.client.destination_id().into_owned();
+        let cid_s2c_0 = pipe.server.destination_id().into_owned();
+
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::Validated(client_addr_2, server_addr))
+        );
+        assert_eq!(pipe.client.path_event_next(), None);
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::New(server_addr, client_addr_2))
+        );
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::Validated(server_addr, client_addr_2))
+        );
+        assert_eq!(pipe.server.path_event_next(), None);
+
+        let pid_c2s_0 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr, server_addr))
+            .expect("no such path");
+        let pid_c2s_1 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr_2, server_addr))
+            .expect("no such path");
+        let pid_s2c_0 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr))
+            .expect("no such path");
+        let pid_s2c_1 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr_2))
+            .expect("no such path");
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+
+        let path_c2s_0_addrs = (path_c2s_0.local_addr(), path_c2s_0.peer_addr());
+        let path_c2s_1_addrs = (path_c2s_1.local_addr(), path_c2s_1.peer_addr());
+        let path_s2c_0_addrs = (path_s2c_0.local_addr(), path_s2c_0.peer_addr());
+        let path_s2c_1_addrs = (path_s2c_1.local_addr(), path_s2c_1.peer_addr());
+
+        log::trace!("path 0: {path_c2s_0_addrs:?}");
+        log::trace!("path 1: {path_c2s_1_addrs:?}");
+
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_c2s_1.active(), false);
+        assert_eq!(path_s2c_0.active(), true);
+        assert_eq!(path_s2c_1.active(), false);
+
+        assert_eq!(
+            pipe.client.set_active(client_addr_2, server_addr, true,),
+            Ok(())
+        );
+        assert_eq!(
+            pipe.server.set_active(server_addr, client_addr_2, true,),
+            Ok(())
+        );
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_c2s_1.active(), true);
+        assert_eq!(path_s2c_0.active(), true);
+        assert_eq!(path_s2c_1.active(), true);
+
+        // Flush the ACK_MP on the newly active path.
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Send data one two streams, using two different paths
+        const DATA_BYTES: usize = 6000;
+        let buf = [42; DATA_BYTES];
+        let mut recv_buf = [0; DATA_BYTES];
+
+        // Send on stream 0 pinned to path 0
+        log::trace!("client send on stream 0 pinned to path 0");
+        assert_eq!(pipe.client.stream_send(0, &buf, true), Ok(DATA_BYTES));
+        pipe.client
+            .streams
+            .get_mut(0)
+            .unwrap()
+            .set_pin_path(pid_c2s_0);
+
+        // Send on stream 4 pinned to path 1
+        log::trace!("client send on stream 4 pinned to path 1");
+        assert_eq!(pipe.client.stream_send(4, &buf, true), Ok(DATA_BYTES));
+        log::trace!("pin path");
+        pipe.client
+            .streams
+            .get_mut(4)
+            .unwrap()
+            .set_pin_path(pid_c2s_1);
+
+        log::trace!("advance pipe on path 0");
+        assert_eq!(
+            pipe.advance_on_path(
+                Some(path_c2s_0_addrs.0),
+                Some(path_c2s_0_addrs.1)
+            ),
+            Ok(())
+        );
+
+        log::trace!("advance pipe on path 1");
+        assert_eq!(
+            pipe.advance_on_path(
+                Some(path_c2s_1_addrs.0),
+                Some(path_c2s_1_addrs.1)
+            ),
+            Ok(())
+        );
+
+        // Server recv stream 0 on path 0
+        log::trace!("server recv on stream 0 pinned to path 0");
+        let (rcv_data, fin) = pipe.server.stream_recv(0, &mut recv_buf).unwrap();
+        assert_eq!(rcv_data, DATA_BYTES);
+        assert_eq!(fin, true, "fin");
+        assert_eq!(
+            pipe.server.streams.get_mut(0).unwrap().pin_path,
+            Some(pid_s2c_0)
+        );
+
+        // Server recv stream 4 on path 1
+        log::trace!("server recv on stream 4 pinned to path 1");
+        let (rcv_data, fin) = pipe.server.stream_recv(4, &mut recv_buf).unwrap();
+        assert_eq!(rcv_data, DATA_BYTES);
+        assert_eq!(fin, true);
+        assert_eq!(
+            pipe.server.streams.get_mut(4).unwrap().pin_path,
+            Some(pid_s2c_1)
+        );
+
+        assert_eq!(pipe.server.path_event_next(), None);
+
+        // Server send on stream 0 and 4
+        log::trace!("server send on stream 0");
+        assert_eq!(pipe.server.stream_send(0, &buf, true), Ok(DATA_BYTES));
+        log::trace!("server send on stream 4");
+        assert_eq!(pipe.server.stream_send(4, &buf, true), Ok(DATA_BYTES));
+
+        let mut _scratch_buf = [42; 1500];
+
+        // Soliciting packets for specific paths respects affinities
+        log::trace!("server solicit pkt on path 0");
+        let (_len, _) = pipe
+            .server
+            .send_on_path(
+                &mut recv_buf,
+                Some(path_s2c_0_addrs.0),
+                Some(path_s2c_0_addrs.1),
+            )
+            .expect("send on path");
+        // let frames =
+        //    testing::decode_pkt(&mut pipe.client, &mut scratch_buf,
+        // len).unwrap(); assert!(
+        //    frames.iter().all(|frame| {
+        //        if let frame::Frame::Stream { stream_id, .. } = frame {
+        //            if *stream_id != 0 {
+        //                return false;
+        //            }
+        //        }
+        //        true
+        //    }),
+        //    "path 0 should only yield stream 0 frames"
+        //);
+
+        log::trace!("server solicit pkt on path 1");
+        let (_len, _) = pipe
+            .server
+            .send_on_path(
+                &mut recv_buf,
+                Some(path_s2c_1_addrs.0),
+                Some(path_s2c_1_addrs.1),
+            )
+            .expect("send on path");
+        // let frames =
+        //    testing::decode_pkt(&mut pipe.client, &mut scratch_buf,
+        // len).unwrap(); assert!(
+        //    frames.iter().all(|frame| {
+        //        if let frame::Frame::Stream { stream_id, .. } = frame {
+        //            if *stream_id != 4 {
+        //                return false;
+        //            }
+        //        }
+        //        true
+        //    }),
+        //    "path 1 should only yield stream 4 frames"
+        //);
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_c2s_1.active(), true);
+        assert_eq!(path_s2c_0.active(), true);
+        assert_eq!(path_s2c_1.active(), true);
 
         // Now close the initial path.
         assert_eq!(

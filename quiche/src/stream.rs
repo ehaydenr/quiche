@@ -659,6 +659,9 @@ pub struct Stream {
 
     /// Whether the stream can be flushed incrementally. Default is `true`.
     pub incremental: bool,
+
+    /// Network path this stream is pinned to
+    pub pin_path: Option<usize>,
 }
 
 impl Stream {
@@ -675,7 +678,13 @@ impl Stream {
             data: None,
             urgency: DEFAULT_URGENCY,
             incremental: true,
+            pin_path: None,
         }
+    }
+
+    /// Sets the path this stream is pinned to
+    pub fn set_pin_path(&mut self, send_pid: usize) {
+        self.pin_path = Some(send_pid);
     }
 
     /// Returns true if the stream has data to read.
