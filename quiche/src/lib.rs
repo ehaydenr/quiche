@@ -16624,11 +16624,11 @@ mod tests {
         log::trace!("server send on stream 4");
         assert_eq!(pipe.server.stream_send(4, &buf, true), Ok(DATA_BYTES));
 
-        let mut _scratch_buf = [42; 1500];
+        let mut scratch_buf = [42; 1500];
 
         // Soliciting packets for specific paths respects affinities
         log::trace!("server solicit pkt on path 0");
-        let (_len, _) = pipe
+        let (len, _) = pipe
             .server
             .send_on_path(
                 &mut recv_buf,
@@ -16636,22 +16636,22 @@ mod tests {
                 Some(path_s2c_0_addrs.1),
             )
             .expect("send on path");
-        // let frames =
-        //    testing::decode_pkt(&mut pipe.client, &mut scratch_buf,
-        // len).unwrap(); assert!(
-        //    frames.iter().all(|frame| {
-        //        if let frame::Frame::Stream { stream_id, .. } = frame {
-        //            if *stream_id != 0 {
-        //                return false;
-        //            }
-        //        }
-        //        true
-        //    }),
-        //    "path 0 should only yield stream 0 frames"
-        //);
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut scratch_buf, len).unwrap();
+        assert!(
+            frames.iter().all(|frame| {
+                if let frame::Frame::Stream { stream_id, .. } = frame {
+                    if *stream_id != 0 {
+                        return false;
+                    }
+                }
+                true
+            }),
+            "path 0 should only yield stream 0 frames"
+        );
 
         log::trace!("server solicit pkt on path 1");
-        let (_len, _) = pipe
+        let (len, _) = pipe
             .server
             .send_on_path(
                 &mut recv_buf,
@@ -16659,19 +16659,19 @@ mod tests {
                 Some(path_s2c_1_addrs.1),
             )
             .expect("send on path");
-        // let frames =
-        //    testing::decode_pkt(&mut pipe.client, &mut scratch_buf,
-        // len).unwrap(); assert!(
-        //    frames.iter().all(|frame| {
-        //        if let frame::Frame::Stream { stream_id, .. } = frame {
-        //            if *stream_id != 4 {
-        //                return false;
-        //            }
-        //        }
-        //        true
-        //    }),
-        //    "path 1 should only yield stream 4 frames"
-        //);
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut scratch_buf, len).unwrap();
+        assert!(
+            frames.iter().all(|frame| {
+                if let frame::Frame::Stream { stream_id, .. } = frame {
+                    if *stream_id != 4 {
+                        return false;
+                    }
+                }
+                true
+            }),
+            "path 1 should only yield stream 4 frames"
+        );
 
         let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
         let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
